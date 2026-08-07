@@ -1,0 +1,179 @@
+name: CD · Front-End
+
+# Despliegue independiente del front-end. Es la plantilla para los otros
+# dos componentes: cd-backend.yml y cd-ml.yml salen de copiar este archivo
+# y cambiar `paths`, el nombre del servicio y el healthcheck.
+#
+# Por qué builds separados: una corrección de CSS no tiene por qué
+# reconstruir la imagen de Spring Boot ni reiniciar el servicio de ML en
+# una VM de 2 OCPUs. El filtro `paths` hace que cada componente se
+# despliegue solo cuando cambia.
+#
+# ROLLBACK: la versión desplegada es el tag de la imagen, y el tag es el
+# SHA del commit. Volver atrás no reconstruye nada — vuelve a levantar una
+# imagen que ya existe en la VM. Manual: Actions → este workflow → Run
+# workflow → indicar el SHA. Automático: si el healthcheck falla después
+# de desplegar, el job restaura solo la imagen anterior.
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'frontend/**'
+      - 'docker-compose.yml'
+      - '.github/workflows/cd-frontend.yml'
+  workflow_dispatch:
+    inputs:
+      ambiente:
+        description: 'Ambiente de destino'
+        required: true
+        type: choice
+        options: [staging, produccion]
+        default: staging
+      tag:
+        description: 'SHA a desplegar (vacío = HEAD de la rama). Usar para rollback.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# Sin cancel-in-progress: cancelar un deploy a mitad de camino deja el
+# ambiente en un estado indefinido. Se encolan.
+concurrency:
+  group: cd-frontend-${{ github.event.inputs.ambiente || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  desplegar:
+    name: Desplegar front-end
+    runs-on: [self-hosted, Linux, ARM64, oci]
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.sha }}
+
+      - name: Resolver ambiente
+        id: env
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            AMBIENTE="${{ github.event.inputs.ambiente }}"
+          elif [ "${{ github.ref_name }}" = "main" ]; then
+            AMBIENTE="produccion"
+          else
+            AMBIENTE="staging"
+          fi
+
+          if [ "$AMBIENTE" = "produccion" ]; then
+            echo "proyecto=energiai-prod"   >> "$GITHUB_OUTPUT"
+            echo "puerto=3000"              >> "$GITHUB_OUTPUT"
+          else
+            echo "proyecto=energiai-staging" >> "$GITHUB_OUTPUT"
+            echo "puerto=3001"               >> "$GITHUB_OUTPUT"
+          fi
+          echo "ambiente=$AMBIENTE" >> "$GITHUB_OUTPUT"
+          echo "tag=${{ github.event.inputs.tag || github.sha }}" >> "$GITHUB_OUTPUT"
+
+          echo "Ambiente: $AMBIENTE"
+
+      - name: Registrar imagen actualmente en ejecución
+        id: previa
+        run: |
+          set -euo pipefail
+          CID=$(docker compose -p "${{ steps.env.outputs.proyecto }}" ps -q frontend 2>/dev/null || true)
+          if [ -n "$CID" ]; then
+            ANTERIOR=$(docker inspect --format '{{.Config.Image}}' "$CID")
+            echo "Imagen en ejecución: $ANTERIOR"
+          else
+            ANTERIOR=""
+            echo "No hay front-end corriendo en este ambiente (primer deploy)."
+          fi
+          echo "imagen=$ANTERIOR" >> "$GITHUB_OUTPUT"
+
+      - name: Construir imagen
+        # En un rollback la imagen ya existe: se reutiliza en lugar de
+        # reconstruirla, que es lo que hace que volver atrás sea inmediato
+        # y que se despliegue exactamente el mismo binario que ya corrió.
+        run: |
+          set -euo pipefail
+          TAG="energiai-frontend:${{ steps.env.outputs.tag }}"
+          if docker image inspect "$TAG" >/dev/null 2>&1; then
+            echo "La imagen $TAG ya existe — se reutiliza (rollback)."
+          else
+            docker build -t "$TAG" ./frontend
+          fi
+
+      - name: Levantar
+        env:
+          FRONTEND_TAG: ${{ steps.env.outputs.tag }}
+          FRONTEND_PORT: ${{ steps.env.outputs.puerto }}
+        run: |
+          set -euo pipefail
+          docker compose -p "${{ steps.env.outputs.proyecto }}" up -d --no-build frontend
+
+      - name: Verificar salud
+        id: salud
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          for i in $(seq 1 10); do
+            if curl -fsS "http://127.0.0.1:${{ steps.env.outputs.puerto }}/" -o /dev/null; then
+              echo "Front-end respondiendo en el intento $i."
+              exit 0
+            fi
+            echo "Sin respuesta todavía (intento $i/10)…"
+            sleep 3
+          done
+          echo "El front-end no respondió después de 30 s."
+          exit 1
+
+      - name: Revertir si falló la verificación
+        if: steps.salud.outcome == 'failure' && steps.previa.outputs.imagen != ''
+        env:
+          FRONTEND_TAG: ${{ steps.previa.outputs.imagen }}
+          FRONTEND_PORT: ${{ steps.env.outputs.puerto }}
+        run: |
+          set -euo pipefail
+          echo "::warning::Deploy fallido. Restaurando ${{ steps.previa.outputs.imagen }}"
+          ANTERIOR="${{ steps.previa.outputs.imagen }}"
+          export FRONTEND_TAG="${ANTERIOR#energiai-frontend:}"
+          docker compose -p "${{ steps.env.outputs.proyecto }}" up -d --no-build frontend
+          echo "Ambiente restaurado a la versión anterior."
+
+      - name: Marcar el job como fallido si hubo rollback
+        if: steps.salud.outcome == 'failure'
+        run: |
+          echo "::error::El despliegue no superó la verificación de salud."
+          exit 1
+
+      - name: Limpiar imágenes viejas del front
+        if: always()
+        # Conserva las 5 más recientes: suficiente para volver atrás varios
+        # deploys sin llenar los ~47 GB del boot volume.
+        run: |
+          set -uo pipefail
+          docker images 'energiai-frontend' --format '{{.Tag}} {{.CreatedAt}}' \
+            | grep -v '^local ' \
+            | sort -k2 -r \
+            | tail -n +6 \
+            | awk '{print "energiai-frontend:" $1}' \
+            | xargs -r docker rmi || true
+
+      - name: Resumen
+        if: always()
+        run: |
+          {
+            echo "### Despliegue del front-end"
+            echo ""
+            echo "| Campo | Valor |"
+            echo "|---|---|"
+            echo "| Ambiente | ${{ steps.env.outputs.ambiente }} |"
+            echo "| Proyecto compose | ${{ steps.env.outputs.proyecto }} |"
+            echo "| Puerto interno | ${{ steps.env.outputs.puerto }} |"
+            echo "| Tag desplegado | ${{ steps.env.outputs.tag }} |"
+            echo "| Versión anterior | ${{ steps.previa.outputs.imagen || '—' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
