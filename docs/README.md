@@ -16,7 +16,8 @@ Esta carpeta organiza toda la documentación técnica, diagramas, resultados y a
 | **🖥️ Front-End** | Arquitectura de la aplicación, decisiones de despliegue e informes por sprint | [Ver Documentación](./frontend/README.md) |
 | **🐍 Data Science** | Análisis EDA, modelos ML y métricas | [Ver Documentación](./data-science/README.md) |
 | **☁️ OCI Cloud** | Configuración de Oracle Cloud (Storage & Compute) | [Ver Documentación](./oci-cloud/README.md) |
-| **⚙️ Gobernanza & GitHub** | Protección de ramas, GitFlow y flujo de CI/CD | [Ver Documentación](./github-config.md) |
+| **🔄 CI/CD** | Workflows, verificación de despliegue, reversión y runbook operativo | [Ver Documentación](./cicd/README.md) |
+| **⚙️ Gobernanza & GitHub** | Protección de ramas, GitFlow y configuración fuera del código | [Ver Documentación](./github-config.md) |
 
 ---
 

@@ -14,17 +14,135 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Detecta qué áreas tocó el cambio para que los jobs pesados se salteen
+  # cuando no corresponden.
+  #
+  # POR QUÉ ACÁ Y NO EN `on: push: paths:`. Filtrar a nivel de workflow parece
+  # más simple pero rompe el despliegue: los CD esperan la conclusión del CI
+  # para este commit, y si el CI directamente no se dispara, esa espera se agota
+  # a los 15 minutos y el despliegue muere con un mensaje engañoso. Pasa, por
+  # ejemplo, al tocar solo `docker-compose.yml`: los tres CD se disparan y el CI
+  # no. Filtrando por job, el run del CI SIEMPRE existe y siempre concluye —
+  # simplemente no hace trabajo de más.
+  #
+  # De paso evita la otra trampa: un job salteado a nivel de workflow deja un
+  # check requerido en "pendiente" para siempre; salteado a nivel de job, no.
+  cambios:
+    name: Detectar áreas afectadas
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      backend: ${{ steps.filtro.outputs.backend }}
+      data_science: ${{ steps.filtro.outputs.data_science }}
+      frontend: ${{ steps.filtro.outputs.frontend }}
+      compose: ${{ steps.filtro.outputs.compose }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Historial completo: hace falta para comparar contra la base.
+          fetch-depth: 0
+
+      - name: Comparar contra la base
+        id: filtro
+        run: |
+          set -uo pipefail
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch -q origin "${{ github.base_ref }}" || true
+            BASE=$(git rev-parse "origin/${{ github.base_ref }}" 2>/dev/null || echo "")
+          else
+            BASE="${{ github.event.before }}"
+          fi
+
+          # Ante cualquier duda —primer push de una rama, historial reescrito,
+          # base inalcanzable— se asume que cambió todo. Correr de más cuesta
+          # unos minutos; saltear de menos deja pasar código sin verificar.
+          if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "No se pudo determinar la base ('$BASE'): se verifica todo."
+            ARCHIVOS=""
+            TODO="si"
+          else
+            ARCHIVOS=$(git diff --name-only "$BASE" "${{ github.sha }}")
+            TODO="no"
+            echo "Archivos cambiados respecto de ${BASE:0:12}:"
+            echo "$ARCHIVOS" | while IFS= read -r archivo; do echo "  $archivo"; done
+          fi
+
+          marcar() {
+            if [ "$TODO" = "si" ] || echo "$ARCHIVOS" | grep -qE "$2"; then
+              echo "$1=true" >> "$GITHUB_OUTPUT"
+              echo "  → $1: sí"
+            else
+              echo "$1=false" >> "$GITHUB_OUTPUT"
+              echo "  → $1: no"
+            fi
+          }
+
+          # `ci.yml` entra en las cuatro porque define estos mismos jobs: si
+          # cambia, hay que ejercitarlos todos. Los `cd-*.yml`, en cambio, NO
+          # entran: tocar un workflow de despliegue no puede romper los tests
+          # de un componente, y `workflows-ci` —que corre siempre, sin
+          # condición— ya los valida con actionlint y el verificador de
+          # consistencia.
+          echo ""
+          echo "Áreas afectadas:"
+          marcar backend      '^backend/|^docker-compose\.yml|^\.github/workflows/ci\.yml'
+          marcar data_science '^data-science/|^docker-compose\.yml|^\.github/workflows/ci\.yml'
+          marcar frontend     '^frontend/|^docker-compose\.yml|^\.github/workflows/ci\.yml'
+          # `compose` cubre lo que hace hoy docker-ci: validar el compose y
+          # construir la imagen del backend. Las de front y ml-service las
+          # construyen sus propios jobs, así que un cambio ahí no lo requiere.
+          marcar compose      '^docker-compose\.yml|^backend/|^\.github/workflows/ci\.yml'
+
+  # Los workflows son código y hasta ahora nada los validaba: un error de
+  # sintaxis o una expresión mal escrita solo se descubría al ejecutarlos, que
+  # en el caso de los CD significa descubrirlo desplegando.
+  workflows-ci:
+    name: Validar workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # actionlint valida la sintaxis, las expresiones ${{ }}, las claves
+      # desconocidas y —vía shellcheck— el shell embebido en cada `run:`.
+      # Fijado por digest: es la herramienta que juzga al resto del CI.
+      - name: actionlint
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo \
+            rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+
+      # actionlint solo revisa el shell embebido en los `run:` de los
+      # workflows; los scripts de .github/scripts/ quedaban sin analizar
+      # justamente cuando son el shell más largo del repositorio.
+      - name: shellcheck de los scripts
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo \
+            koalaman/shellcheck@sha256:bb596a0d169b85ddd81d8b6d3a2ff6d5baf5fca10b97f575ebc647c3dff62b3d \
+            .github/scripts/*.sh
+
+      # Compensa la decisión de mantener los tres CD como archivos separados:
+      # comprueba que ninguno haya perdido una garantía del despliegue.
+      - name: Consistencia entre los tres CD
+        run: bash .github/scripts/verificar-consistencia-cd.sh
+
   backend-ci:
     name: Build & Test Backend (Spring Boot)
+    needs: cambios
+    if: needs.cambios.outputs.backend == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           java-version: '17'
           distribution: 'temurin'
@@ -40,15 +158,17 @@ jobs:
 
   data-science-ci:
     name: Test Data Science Microservice (FastAPI)
+    needs: cambios
+    if: needs.cambios.outputs.data_science == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Python 3.10
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.10'
           cache: 'pip'
@@ -88,32 +208,68 @@ jobs:
       - name: Build Docker image
         run: docker build -t energiai-ml:test -f data-science/Dockerfile data-science
 
+      # Dos verificaciones distintas y complementarias:
+      #   1. El HEALTHCHECK que el propio contenedor declara — es el mismo
+      #      criterio de "sano" que lee el CD al desplegar, asi que conviene
+      #      verificarlo aca en vez de definir uno distinto en cada lado.
+      #   2. Una peticion HTTP real contra el puerto publicado — detecta el
+      #      caso en que el contenedor se declara sano pero no responde
+      #      afuera (bind a la interfaz equivocada, mapeo de puertos mal).
+      #
+      # El plazo es un deadline real, no `sleep` fijo + N intentos: una espera
+      # a ciegas pierde tiempo cuando el arranque es rapido y falla igual
+      # cuando necesita un segundo mas.
       - name: Smoke test container /health
         run: |
+          set -euo pipefail
           docker run -d --name ml-test -p 8765:8000 energiai-ml:test
-          sleep 8
-          for i in 1 2 3 4 5; do
-            if curl -fsS http://localhost:8765/health; then
-              echo "Healthcheck OK"
+          trap 'docker rm -f ml-test >/dev/null 2>&1 || true' EXIT
+
+          LIMITE=$((SECONDS + 60))
+          ESTADO="desconocido"
+          LISTO=0
+          while [ "$SECONDS" -lt "$LIMITE" ]; do
+            ESTADO=$(docker inspect -f \
+              '{{if .State.Health}}{{.State.Health.Status}}{{else}}sin-healthcheck{{end}}' ml-test)
+
+            if [ "$ESTADO" = "unhealthy" ]; then
+              echo "El HEALTHCHECK del contenedor lo marco unhealthy."
               break
             fi
-            echo "Waiting... attempt $i"
-            sleep 3
+
+            if curl -fsS http://localhost:8765/health -o /tmp/salud.json; then
+              LISTO=1
+              break
+            fi
+            sleep 2
           done
-          docker stop ml-test
-          docker rm ml-test
+
+          # Sin este bloque el paso terminaba en exito aunque nunca respondiera:
+          # el bucle agotandose no es un comando fallido, asi que `bash -e` no
+          # lo detecta y el job quedaba en verde con el servicio caido.
+          if [ "$LISTO" -ne 1 ]; then
+            echo "::error::El contenedor de ML no respondio en 60 s (healthcheck: $ESTADO)."
+            echo "--- Logs del contenedor ---"
+            docker logs ml-test
+            exit 1
+          fi
+
+          echo "Respondio a los ${SECONDS}s · estado del healthcheck: $ESTADO"
+          cat /tmp/salud.json
 
   frontend-ci:
     name: Build & Smoke Test Front-End
+    needs: cambios
+    if: needs.cambios.outputs.frontend == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Node 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
           cache: 'npm'
@@ -131,7 +287,10 @@ jobs:
         run: npm run typecheck
 
       - name: Build Docker image
-        run: docker build -t energiai-frontend:test ./frontend
+        run: |
+          docker build \
+            --build-arg VERSION="${{ github.sha }}" \
+            -t energiai-frontend:test ./frontend
 
       # El build de la imagen solo comprueba que COMPILA. Este paso comprueba
       # que además FUNCIONA servida: un typo en nginx.conf o un fallback de
@@ -142,18 +301,29 @@ jobs:
           docker run -d --name front-test -p 8099:8080 energiai-frontend:test
           trap 'docker rm -f front-test >/dev/null 2>&1 || true' EXIT
 
+          # Mismo criterio que el job del ml-service: deadline real y lectura
+          # del HEALTHCHECK del contenedor además de la petición HTTP.
+          LIMITE=$((SECONDS + 30))
+          ESTADO="desconocido"
           LISTO=0
-          for i in 1 2 3 4 5; do
+          while [ "$SECONDS" -lt "$LIMITE" ]; do
+            ESTADO=$(docker inspect -f \
+              '{{if .State.Health}}{{.State.Health.Status}}{{else}}sin-healthcheck{{end}}' front-test)
+
+            if [ "$ESTADO" = "unhealthy" ]; then
+              echo "El HEALTHCHECK del contenedor lo marcó unhealthy."
+              break
+            fi
+
             if curl -fsS http://localhost:8099/ -o /dev/null; then
-              echo "El contenedor responde (intento $i)."
+              echo "El contenedor responde a los ${SECONDS}s (healthcheck: $ESTADO)."
               LISTO=1
               break
             fi
-            echo "Esperando... intento $i"
             sleep 2
           done
           if [ "$LISTO" -ne 1 ]; then
-            echo "El contenedor no respondió."
+            echo "::error::El contenedor no respondió en 30 s (healthcheck: $ESTADO)."
             docker logs front-test
             exit 1
           fi
@@ -161,6 +331,20 @@ jobs:
           echo "Verificando que el HTML referencie el bundle compilado:"
           curl -fsS http://localhost:8099/ | grep -q '/assets/index-.*\.js' \
             && echo "  OK bundle referenciado"
+
+          # Acá sí conviene atarse al patrón del bundle: este job construye la
+          # imagen desde el código de este mismo commit, así que sabe con qué
+          # herramienta se compiló. El CD no puede permitírselo — puede estar
+          # desplegando una versión anterior.
+          echo "Verificando la identidad de la versión servida:"
+          VERSION_SERVIDA=$(curl -fsS http://localhost:8099/version.json \
+            | tr -d ' \n' | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+          if [ "$VERSION_SERVIDA" = "${{ github.sha }}" ]; then
+            echo "  OK /version.json informa $VERSION_SERVIDA"
+          else
+            echo "::error::/version.json informa '$VERSION_SERVIDA' y se construyó '${{ github.sha }}'."
+            exit 1
+          fi
 
           echo "Verificando el fallback del router en rutas del cliente:"
           for RUTA in /resultado /analisis/123 /una-ruta-inexistente; do
@@ -170,13 +354,15 @@ jobs:
           done
 
   docker-ci:
-    name: Build Docker Images
+    name: Validar compose y construir el backend
+    needs: cambios
+    if: needs.cambios.outputs.compose == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Create .env placeholder for compose validation
         # ml-service tiene env_file: .env en docker-compose.yml. CI no necesita
@@ -190,5 +376,13 @@ jobs:
       - name: Validate docker-compose.yml
         run: docker compose config
 
-      - name: Build Docker Images
-        run: docker compose build
+      # Antes acá corría `docker compose build`, que reconstruía los TRES
+      # servicios — incluidos el front-end y el ml-service, que sus propios
+      # jobs ya habían construido y, además, arrancado y probado servidos. Ese
+      # trabajo duplicado se repetía en cada ejecución del CI.
+      #
+      # Queda solo el backend, que es el único servicio cuya imagen no se
+      # construye en ningún otro job: `backend-ci` corre `./mvnw verify`, que
+      # compila y prueba el JAR pero no arma la imagen.
+      - name: Construir la imagen del backend
+        run: docker compose build backend

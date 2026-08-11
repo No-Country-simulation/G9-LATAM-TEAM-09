@@ -1,0 +1,180 @@
+name: Verificación del sistema
+
+# Verificación de INTEGRACIÓN. Deliberadamente separada de los CD.
+#
+# Por qué existe aparte: cada CD verifica solo el contrato del componente que
+# despliega, y tiene que seguir siendo así. Si el CD del backend exigiera un
+# análisis completo, un backend perfectamente sano quedaría bloqueado porque
+# falta el modelo del ml-service — atribuiría el fallo al equipo equivocado y
+# dispararía una reversión que no arregla nada. La verificación cruzada existe,
+# pero vive acá y no controla el despliegue de nadie.
+#
+# Cubre además el hueco de disponibilidad: los dominios estuvieron devolviendo
+# 502 desde el 27/07 hasta el 09/08 y nadie se enteró, porque nada los miraba.
+# Al correr por calendario contra el dominio público, ese chequeo sale gratis.
+
+# ⚠️ `schedule` y `workflow_run` SOLO se ejecutan desde la rama por defecto del
+# repositorio, que hoy es `develop`. Este archivo tiene que estar en `develop`
+# para que corran, y si algún día se cambia la rama por defecto a `main`, la
+# verificación deja de ejecutarse hasta que el archivo llegue ahí.
+on:
+  schedule:
+    # Cada 30 minutos. El cron de GitHub puede retrasarse varios minutos: sirve
+    # para enterarse el mismo día, no para medir un SLA.
+    - cron: '*/30 * * * *'
+  workflow_run:
+    # Después de cualquier despliegue, para verificar el sistema completo con
+    # la versión recién publicada.
+    # Los nombres tienen que coincidir EXACTAMENTE con el `name:` de cada
+    # workflow. `workflow_run` los busca por texto: un nombre mal escrito no da
+    # error, simplemente nunca dispara. Lo verifica el script de consistencia.
+    workflows: ['CD · Front-End', 'CD Backend (Spring Boot)', 'CD Data Science / ML (FastAPI)']
+    types: [completed]
+  workflow_dispatch:
+
+# Este workflow no clona el repositorio ni consulta la API de GitHub: solo hace
+# peticiones HTTP contra los dominios públicos. Sin permisos, entonces.
+permissions: {}
+
+# A diferencia de los CD, acá cancelar una verificación a medias no deja nada
+# en estado indefinido: no modifica nada, solo observa. Si llegan tres seguidas
+# —un push que toca varios componentes dispara varios CD— basta con la última.
+concurrency:
+  group: verificacion-sistema
+  cancel-in-progress: true
+
+jobs:
+  verificar:
+    name: Verificar ${{ matrix.ambiente }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # Los dos ambientes, siempre. Verificar staging y no verificar producción
+    # dejaría sin comprobar justamente el paso que más importa.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ambiente: staging
+            dominio: energiai-staging.unixsoluciones.com
+          - ambiente: produccion
+            dominio: energiai.unixsoluciones.com
+
+    steps:
+      - name: Verificar el sistema de punta a punta
+        env:
+          DOMINIO: ${{ matrix.dominio }}
+          AMBIENTE: ${{ matrix.ambiente }}
+          # Marca de sonda. Identifica esta petición como un chequeo de salud
+          # automatizado para que el backend no la registre como un análisis
+          # real ni la cuente en los datos agregados.
+          #
+          # ⚠️ TIENE QUE SER UN SECRETO, no una cabecera booleana: un
+          #    `X-Sonda: true` lo manda cualquiera desde internet y obtiene el
+          #    mismo trato. El backend debe compararlo con comparación de
+          #    tiempo constante y no registrarlo nunca en sus logs.
+          #
+          # ⚠️ LÍMITE DE DISEÑO: esta marca solo puede controlar PERSISTENCIA y
+          #    TELEMETRÍA. Nunca autorización, nunca límites de uso, nunca
+          #    validación. Si algún día decidiera el límite de consultas
+          #    (PA-07), dejaría de ser una marca y pasaría a ser una llave para
+          #    saltear restricciones: el daño de que se filtre subiría de "se
+          #    contaron mal unos análisis" a "alguien evade el límite".
+          #
+          # Mientras el secreto no exista, se envía vacío y el backend la
+          # ignora como cualquier cabecera desconocida.
+          TOKEN_SONDA: ${{ secrets.TOKEN_SONDA_SALUD }}
+        run: |
+          set -uo pipefail
+
+          FRONT="no-evaluado"
+          API="no-evaluado"
+          ANALISIS="no-evaluado"
+          DETALLE=""
+
+          echo "## Verificación de $AMBIENTE — $DOMINIO"
+          echo ""
+
+          # ---- 1. El front-end se sirve ------------------------------------
+          # Acá el criterio es más laxo que en el CD, y es deliberado: este
+          # workflow no sabe qué versión DEBERÍA estar corriendo. El CD sí lo
+          # sabe —acaba de publicarla— y por eso es él quien compara contra el
+          # SHA esperado. Exigir acá una versión concreta daría por caído un
+          # ambiente que sirve una versión anterior perfectamente sana.
+          HTTP=$(curl -sS -o /tmp/front.html -w "%{http_code}" --max-time 20 "https://$DOMINIO/" || true)
+          if [ "$HTTP" = "200" ]; then
+            FRONT="ok"
+          else
+            FRONT="caido"
+            DETALLE="el dominio devolvió HTTP $HTTP"
+          fi
+
+          # La versión se INFORMA, no se exige. Es el dato que hace evidente de
+          # un vistazo que un ambiente quedó atrás respecto del otro, algo que
+          # hasta ahora solo se descubría comparando commits a mano.
+          VERSION=$(curl -fsS --max-time 10 "https://$DOMINIO/version.json" 2>/dev/null \
+            | tr -d ' \n' | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+          [ -z "$VERSION" ] && VERSION="no informa"
+
+          echo "Front-end        $FRONT (HTTP $HTTP) · versión: $VERSION"
+
+          # ---- 2. La API responde y valida ---------------------------------
+          HTTP_API=$(curl -sS -o /tmp/api.json -w "%{http_code}" --max-time 20 \
+            "https://$DOMINIO/actuator/health" || true)
+          if [ "$HTTP_API" = "200" ] && grep -q '"status":"UP"' /tmp/api.json; then
+            API="ok"
+          else
+            API="caido"
+            DETALLE="${DETALLE:-la API devolvió HTTP $HTTP_API en /actuator/health}"
+          fi
+          echo "API              $API (HTTP $HTTP_API)"
+
+          # ---- 3. El análisis completo -------------------------------------
+          # Es la única prueba que recorre front → API → ml-service → modelo.
+          # Ningún CD puede hacerla sin atribuir mal el fallo.
+          HTTP_AN=$(curl -sS -o /tmp/analisis.json -w "%{http_code}" --max-time 30 \
+            -X POST "https://$DOMINIO/api/v1/analisis-energetico" \
+            -H "Content-Type: application/json" \
+            -H "X-EnergiAI-Sonda: ${TOKEN_SONDA}" \
+            -A "EnergiAI-VerificacionSistema/1.0" \
+            -d '{"consumo_kwh":450.5,"cantidad_equipos":8,"tipo_inmueble":"Casa","uso_horario_pico":true,"horas_alto_consumo":6,"metros_cuadrados":80,"antiguedad_vivienda":20,"zona_fria":false,"calidad_aislamiento":"Media","fuente_calefaccion":"Electricidad","fuente_agua_caliente":"Electricidad"}' || true)
+
+          # Los saltos de línea se eliminan: el detalle termina dentro de una
+          # cita del resumen, y un cuerpo multilínea la rompería dejando
+          # visible solo el primer renglón.
+          CUERPO=$(head -c 300 /tmp/analisis.json 2>/dev/null | tr -d '\r\n' || true)
+          if [ "$HTTP_AN" = "200" ] && grep -q '"categoria"' /tmp/analisis.json; then
+            ANALISIS="ok"
+          else
+            ANALISIS="fallo"
+            DETALLE="${DETALLE:-el análisis devolvió HTTP $HTTP_AN: $CUERPO}"
+          fi
+          echo "Análisis         $ANALISIS (HTTP $HTTP_AN)"
+          echo ""
+
+          # ---- Resumen ------------------------------------------------------
+          {
+            echo "### $AMBIENTE — \`$DOMINIO\`"
+            echo ""
+            echo "| Capa | Estado |"
+            echo "|---|---|"
+            echo "| Front-end servido | \`$FRONT\` (HTTP $HTTP) |"
+            echo "| Versión del front | \`$VERSION\` |"
+            echo "| API respondiendo | \`$API\` (HTTP $HTTP_API) |"
+            echo "| Análisis de punta a punta | \`$ANALISIS\` (HTTP $HTTP_AN) |"
+            echo ""
+            if [ -n "$DETALLE" ]; then
+              echo "> **Dónde se corta:** $DETALLE"
+              echo ""
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$FRONT" = "ok" ] && [ "$API" = "ok" ] && [ "$ANALISIS" = "ok" ]; then
+            echo "Sistema completo operativo en $AMBIENTE."
+            exit 0
+          fi
+
+          # Termina en rojo a propósito: el correo de GitHub ante un workflow
+          # programado fallido es el único canal de aviso que hoy tenemos.
+          echo "::error::El sistema no está completo en $AMBIENTE. $DETALLE"
+          exit 1

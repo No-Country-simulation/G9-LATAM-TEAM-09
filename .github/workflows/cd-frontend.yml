@@ -37,6 +37,7 @@ on:
 
 permissions:
   contents: read
+  actions: read # consultar la conclusión del CI para este commit
 
 # El ambiente TIENE que formar parte del nombre del grupo. Si agrupáramos
 # solo por "cd-frontend", un deploy a producción cancelaría uno pendiente
@@ -52,8 +53,75 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # El CD y el CI se disparan con el mismo evento `push`, así que sin esta
+  # compuerta arrancaban en paralelo: un commit con los tests en rojo se
+  # desplegaba igual, porque el deploy no esperaba el veredicto.
+  #
+  # Por qué una compuerta y no `on: workflow_run`: ese disparador ignora el
+  # filtro `paths` (todos los componentes se desplegarían ante cualquier
+  # cambio), resuelve `github.ref`/`github.sha` contra la rama por defecto en
+  # lugar del commit que lo originó, y solo ejecuta la versión del archivo que
+  # está en la rama por defecto. Los tres efectos rompen este workflow.
+  #
+  # Corre en un runner de GitHub, no en el propio: esperar en el runner de la
+  # VM lo dejaría ocupado sin hacer nada y bloquearía los demás despliegues.
+  esperar_ci:
+    name: Esperar al CI
+    # En un rollback se despliega un SHA que ya estuvo en ejecución. Volver a
+    # exigirle el CI impediría revertir justo cuando más se necesita.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Verificar que el CI de este commit terminó en verde
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          LIMITE=$((SECONDS + 900))
+
+          while [ "$SECONDS" -lt "$LIMITE" ]; do
+            LINEA=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA" \
+              --jq '[.workflow_runs[] | select(.path == ".github/workflows/ci.yml")]
+                    | sort_by(.run_number) | last
+                    | "\(.status // "") \(.conclusion // "")"' 2>/dev/null || echo "")
+
+            ESTADO=$(echo "$LINEA" | awk '{print $1}')
+            RESULTADO=$(echo "$LINEA" | awk '{print $2}')
+
+            case "$ESTADO" in
+              completed)
+                if [ "$RESULTADO" = "success" ]; then
+                  echo "CI en verde para $SHA. Continúa el despliegue."
+                  exit 0
+                fi
+                echo "::error::El CI de este commit terminó en '$RESULTADO'. No se despliega."
+                echo "Para desplegar igual: Run workflow indicando este SHA a mano."
+                exit 1
+                ;;
+              "")
+                echo "Todavía no hay run del CI para $SHA. Esperando... (${SECONDS}s)"
+                ;;
+              *)
+                echo "CI en estado '$ESTADO'. Esperando... (${SECONDS}s)"
+                ;;
+            esac
+            sleep 15
+          done
+
+          echo "::error::El CI no concluyó en 15 minutos. No se despliega."
+          exit 1
+
   desplegar:
     name: Desplegar front-end
+    needs: esperar_ci
+    # `needs` de un job salteado saltea también al dependiente, y en un
+    # `workflow_dispatch` la compuerta no corre. Sin esta condición, el
+    # rollback manual quedaría inutilizable.
+    if: always() && (needs.esperar_ci.result == 'success' || needs.esperar_ci.result == 'skipped')
     # `oci` es la única etiqueta propia del runner (las demás las agrega
     # GitHub sola). Depender solo de ella deja menos formas de que el job
     # quede encolado sin error si el runner se re-registra.
@@ -63,7 +131,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.inputs.tag || github.sha }}
 
@@ -122,7 +190,12 @@ jobs:
           if docker image inspect "$TAG" > /dev/null 2>&1; then
             echo "La imagen $TAG ya existe — se reutiliza (rollback)."
           else
-            docker build -t "$TAG" ./frontend
+            # VERSION queda escrito dentro de la imagen, en /version.json, y es
+            # lo que después permite comprobar que el contenedor que responde
+            # es este y no uno anterior que quedó en pie.
+            docker build \
+              --build-arg VERSION="${{ steps.env.outputs.tag }}" \
+              -t "$TAG" ./frontend
           fi
           # Verificar que la imagen quedó correctamente taggeada antes de continuar
           docker image inspect "$TAG" > /dev/null 2>&1 || {
@@ -179,33 +252,151 @@ jobs:
           docker compose --env-file "${{ steps.dotenv.outputs.env_file }}" \
             -p "${{ steps.env.outputs.proyecto }}" up -d --no-build --no-deps frontend
 
+      # Verificación en tres capas. Cada una prueba algo distinto y, sobre todo,
+      # implica un responsable distinto:
+      #
+      #   Capa 1 · contenedor — arrancó y su HEALTHCHECK no lo marcó unhealthy
+      #   Capa 2 · proceso    — responde por el puerto publicado
+      #   Capa 3 · contrato   — hace efectivamente aquello para lo que existe
+      #
+      # Se verifican las dos cosas —el HEALTHCHECK que declara el contenedor y
+      # una petición real contra el puerto— porque fallan por motivos distintos:
+      # un contenedor puede declararse sano y no ser alcanzable desde afuera, y
+      # al revés.
+      #
+      # El plazo es un deadline real y no "intentos x sleep": así el límite es
+      # exactamente el que dice el comentario, sin depender de cuánto tarde cada
+      # petición.
       - name: Verificar salud
         id: salud
         continue-on-error: true
         run: |
           set -uo pipefail
-          # nginx arranca rápido; 10 x 3 s = 30 s es suficiente
-          for i in $(seq 1 10); do
-            echo "Intento $i/10 - http://127.0.0.1:${{ steps.env.outputs.puerto }}/"
-            HTTP=$(curl -o /dev/null -w "%{http_code}" -sS \
-              "http://127.0.0.1:${{ steps.env.outputs.puerto }}/" 2>/tmp/fe_err.txt || true)
-            if [ "$HTTP" = "200" ] || [ "$HTTP" = "304" ]; then
-              echo "Front-end respondiendo OK (intento $i). HTTP $HTTP"
-              exit 0
+          CAPA1="no-evaluada"
+          CAPA2="no-evaluada"
+          CAPA3="no-evaluada"
+          HTTP="-"
+          SALUD_DOCKER="desconocido"
+          DETALLE=""
+          REGRESION="no"
+
+          registrar() {
+            {
+              echo "capa1=$CAPA1"
+              echo "capa2=$CAPA2"
+              echo "capa3=$CAPA3"
+              echo "http=$HTTP"
+              echo "docker=$SALUD_DOCKER"
+              echo "segundos=$SECONDS"
+              echo "regresion=$REGRESION"
+              echo "detalle=$DETALLE"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          # ---- Capas 1 y 2: se resuelven en el mismo bucle de espera --------
+          LIMITE=$((SECONDS + 30))   # nginx arranca rápido
+          while [ "$SECONDS" -lt "$LIMITE" ]; do
+            CID=$(docker compose -p "${{ steps.env.outputs.proyecto }}" ps -q frontend 2>/dev/null || true)
+
+            # Se reevalua en cada vuelta en lugar de quedar fijada: si el
+            # contenedor arranca y muere a mitad de la espera, el fallo tiene
+            # que atribuirse a la capa 1 —el contenedor no se sostiene— y no a
+            # la capa 2, que reportaria "no responde" y apuntaria al lugar
+            # equivocado.
+            if [ -n "$CID" ]; then
+              CAPA1="ok"
+              SALUD_DOCKER=$(docker inspect --format \
+                '{{if .State.Health}}{{.State.Health.Status}}{{else}}sin-healthcheck{{end}}' "$CID" 2>/dev/null || echo "desconocido")
+              if [ "$SALUD_DOCKER" = "unhealthy" ]; then
+                CAPA1="fallo"
+                DETALLE="el HEALTHCHECK del contenedor lo marcó unhealthy"
+                break
+              fi
+            else
+              CAPA1="no-evaluada"
             fi
-            echo "  HTTP: $HTTP"
-            cat /tmp/fe_err.txt 2>/dev/null || true
+
+            HTTP=$(curl -o /dev/null -w "%{http_code}" -sS "http://127.0.0.1:${{ steps.env.outputs.puerto }}/" 2>/tmp/err_salud.txt || true)
+            if [ "$HTTP" = "200" ] || [ "$HTTP" = "304" ]; then
+              CAPA2="ok"
+              break
+            fi
+
+            echo "  ${SECONDS}s · HTTP: $HTTP · healthcheck: $SALUD_DOCKER"
             sleep 3
           done
-          echo "El front-end no respondió después de 30 s."
+
+          if [ "$CAPA1" = "no-evaluada" ]; then
+            CAPA1="fallo"
+            DETALLE="el contenedor no está en ejecución"
+          elif [ "$CAPA1" = "ok" ] && [ "$CAPA2" != "ok" ]; then
+            CAPA2="fallo"
+            DETALLE="el servicio no respondió en 30 s (último HTTP: $HTTP)"
+          fi
+
+          # ---- Capa 3: el HTML servido referencia el bundle compilado ----
+          if [ "$CAPA1" = "ok" ] && [ "$CAPA2" = "ok" ]; then
+            # Se consulta /version.json, que la imagen escribe en el build, en
+            # lugar de raspar el HTML.
+            #
+            # Raspar el HTML no sirve para lo que un despliegue tiene que
+            # comprobar: tanto buscar el patrón del bundle como buscar el
+            # título dan verde si el contenedor ANTERIOR sigue en pie y
+            # responde — que es precisamente el fallo a detectar. Además, el
+            # primero ata la verificación a la herramienta de build y el
+            # segundo a un texto visible al usuario, que puede cambiar por
+            # motivos de redacción.
+            #
+            # Comparar la versión servida contra el SHA que se acaba de
+            # publicar responde la pregunta correcta: ¿está sirviendo ESTO?
+            VERSION_SERVIDA=$(curl -fsS --max-time 10 \
+              "http://127.0.0.1:${{ steps.env.outputs.puerto }}/version.json" 2>/dev/null \
+              | tr -d ' \n' | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+
+            if [ "$VERSION_SERVIDA" = "${{ steps.env.outputs.tag }}" ]; then
+              CAPA3="ok"
+            elif [ -z "$VERSION_SERVIDA" ]; then
+              CAPA3="fallo"
+              DETALLE="/version.json no respondió o no trae el campo 'version': el contenedor no sirve una imagen construida por este workflow"
+            else
+              CAPA3="fallo"
+              DETALLE="está sirviendo la versión '$VERSION_SERVIDA' cuando se desplegó '${{ steps.env.outputs.tag }}': el contenedor anterior sigue en pie"
+            fi
+          fi
+
+          # ---- Veredicto ----------------------------------------------------
+          echo ""
+          echo "Capa 1 · contenedor   $CAPA1   (healthcheck: $SALUD_DOCKER)"
+          echo "Capa 2 · proceso      $CAPA2   (HTTP: $HTTP)"
+          echo "Capa 3 · contrato     $CAPA3   (el HTML servido referencia el bundle compilado)"
+          [ -n "$DETALLE" ] && echo "Detalle: $DETALLE"
+          echo ""
+
+          if [ "$CAPA1" != "ok" ] || [ "$CAPA2" != "ok" ]; then
+            REGRESION="si"
+          fi
+          if [ "$CAPA3" = "fallo" ]; then
+            REGRESION="si"
+          fi
+
+          if [ "$CAPA1" = "ok" ] && [ "$CAPA2" = "ok" ] && [ "$CAPA3" = "ok" ]; then
+            echo "Verificación superada a los ${SECONDS}s."
+            registrar
+            exit 0
+          fi
+
+          registrar
           echo "--- Logs del contenedor frontend ---"
           docker compose -p "${{ steps.env.outputs.proyecto }}" logs --tail=50 frontend || true
           echo "--- Estado de contenedores ---"
           docker compose -p "${{ steps.env.outputs.proyecto }}" ps || true
           exit 1
 
+      # Solo se revierte ante una regresión de esta versión: si el contenedor
+      # no levanta, no responde o su propio contrato se rompió. Revertir es la
+      # respuesta correcta porque la versión anterior sí funcionaba.
       - name: Revertir si falló la verificación
-        if: steps.salud.outcome == 'failure' && steps.previa.outputs.tag != ''
+        if: steps.salud.outputs.regresion == 'si' && steps.previa.outputs.tag != ''
         env:
           FRONTEND_TAG: ${{ steps.previa.outputs.tag }}
           FRONTEND_PORT: ${{ steps.env.outputs.puerto }}
@@ -222,7 +413,7 @@ jobs:
           docker compose --env-file "${{ steps.dotenv.outputs.env_file }}" -p "${{ steps.env.outputs.proyecto }}" up -d --no-build --no-deps frontend
           echo "Ambiente restaurado."
 
-      - name: Marcar el job como fallido si hubo rollback
+      - name: Marcar el job como fallido si la verificación no pasó
         if: steps.salud.outcome == 'failure'
         run: |
           echo "::error::El despliegue no superó la verificación de salud."
@@ -251,19 +442,84 @@ jobs:
                 fi
               done
 
+      # Se consulta el estado REAL al terminar en lugar de asumirlo. El resumen
+      # anterior informaba siempre la versión nueva como desplegada, incluso
+      # cuando la verificación había fallado y el job la había revertido: justo
+      # en el caso en que alguien lee el resumen, decía lo contrario de lo que
+      # estaba corriendo.
+
+      # El paso anterior limpia IMÁGENES, pero el build cache de Docker crece
+      # aparte y nadie lo miraba: al 11/08 había 6,4 GB en la VM, 4 de ellos
+      # recuperables. Ese disco lo comparten los dos ambientes, así que
+      # llenarlo los tira a los dos juntos.
+      #
+      # 72 h conserva el cache de los despliegues recientes —que es el que de
+      # verdad acelera un build— y descarta el resto. Los "|| true" son a
+      # propósito: quedarse sin podar no debe marcar en rojo un despliegue
+      # que sí funcionó.
+      - name: Podar build cache antiguo
+        if: always()
+        run: |
+          set -uo pipefail
+          echo "Uso de disco de Docker antes de podar:"
+          docker system df || true
+          docker builder prune --force --filter "until=72h" || true
+          echo "Después de podar:"
+          docker system df || true
+
+      - name: Determinar qué versión quedó en ejecución
+        id: final
+        if: always()
+        run: |
+          set -uo pipefail
+          CID=$(docker compose -p "${{ steps.env.outputs.proyecto }}" ps -q frontend 2>/dev/null || true)
+          if [ -n "$CID" ]; then
+            IMAGEN=$(docker inspect --format '{{.Config.Image}}' "$CID" 2>/dev/null || echo "")
+            EN_EJECUCION="${IMAGEN#energiai-frontend:}"
+          else
+            EN_EJECUCION=""
+          fi
+
+          if [ -z "$EN_EJECUCION" ]; then
+            ESTADO="⛔ sin servicio en ejecución"
+          elif [ "$EN_EJECUCION" = "${{ steps.env.outputs.tag }}" ]; then
+            ESTADO="✅ versión nueva en ejecución"
+          else
+            ESTADO="↩️ revertido a la versión anterior"
+          fi
+
+          echo "tag=$EN_EJECUCION" >> "$GITHUB_OUTPUT"
+          echo "estado=$ESTADO"    >> "$GITHUB_OUTPUT"
+          echo "Resultado real: $ESTADO (tag: ${EN_EJECUCION:-ninguno})"
+
       - name: Resumen
         if: always()
         run: |
           {
             echo "### Despliegue del front-end"
             echo ""
+            echo "**Resultado:** ${{ steps.final.outputs.estado }}"
+            echo ""
+            echo "| Verificación | Qué prueba | Estado |"
+            echo "|---|---|---|"
+            echo "| Capa 1 · contenedor | Arrancó y su healthcheck no lo marcó \`unhealthy\` | \`${{ steps.salud.outputs.capa1 }}\` (healthcheck: \`${{ steps.salud.outputs.docker }}\`) |"
+            echo "| Capa 2 · proceso | Responde por el puerto publicado | \`${{ steps.salud.outputs.capa2 }}\` (HTTP ${{ steps.salud.outputs.http }}) |"
+            echo "| Capa 3 · contrato | el HTML referencia el bundle compilado | \`${{ steps.salud.outputs.capa3 }}\` |"
+            echo ""
+            if [ -n "${{ steps.salud.outputs.detalle }}" ]; then
+              echo "> **Detalle:** ${{ steps.salud.outputs.detalle }}"
+              echo ""
+            fi
             echo "| Campo | Valor |"
             echo "|---|---|"
             echo "| Ambiente | ${{ steps.env.outputs.ambiente }} |"
             echo "| Proyecto compose | ${{ steps.env.outputs.proyecto }} |"
             echo "| Puerto interno | ${{ steps.env.outputs.puerto }} |"
-            echo "| Versión desplegada | \`${{ steps.env.outputs.tag }}\` |"
-            echo "| Versión anterior | \`${{ steps.previa.outputs.tag || '—' }}\` |"
+            echo "| **Versión en ejecución** | \`${{ steps.final.outputs.tag || '—' }}\` |"
+            echo "| Versión que se intentó desplegar | \`${{ steps.env.outputs.tag }}\` |"
+            echo "| Versión previa al despliegue | \`${{ steps.previa.outputs.tag || '—' }}\` |"
+            echo "| Tiempo hasta el veredicto | ${{ steps.salud.outputs.segundos || '—' }}s |"
+            echo "| ¿Se consideró regresión? | ${{ steps.salud.outputs.regresion || '—' }} |"
             echo ""
             echo "Para volver atrás: *Run workflow* con el SHA de la versión anterior."
           } >> "$GITHUB_STEP_SUMMARY"

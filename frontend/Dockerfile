@@ -27,6 +27,27 @@ ENV VITE_API_MODO=${VITE_API_MODO}
 
 RUN npm run build
 
+# Identidad de lo que sirve este contenedor, en un archivo que una máquina
+# pueda leer.
+#
+# POR QUÉ HACE FALTA. Sin esto, la verificación del despliegue solo puede
+# raspar el HTML, y eso no distingue "la versión nueva está sirviendo" de "el
+# contenedor anterior sigue en pie y responde igual de bien" — que es
+# justamente el fallo que un despliegue tiene que detectar. Con este archivo,
+# el CD compara lo que responde el contenedor contra el SHA que acaba de
+# publicar.
+#
+# Va en la etapa de build y no en la final a propósito: la imagen de nginx sin
+# privilegios corre como usuario `nginx`, que no puede escribir en
+# /usr/share/nginx/html. Generarlo acá evita tener que pasar por `USER root`
+# solo para crear un archivo de 60 bytes.
+#
+# El valor viaja DENTRO de la imagen, así que en un rollback —donde la imagen
+# se reutiliza sin reconstruir— describe correctamente la versión restaurada.
+# El valor por defecto permite construir a mano sin pasar el argumento.
+ARG VERSION=desconocida
+RUN printf '{"servicio":"frontend","version":"%s"}\n' "$VERSION" > dist/version.json
+
 # ---------- etapa de servicio ----------
 # Base fijada por digest y no por etiqueta. `1.27-alpine` es móvil: los
 # mantenedores publican parches bajo el mismo nombre, así que el mismo

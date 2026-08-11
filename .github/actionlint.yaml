@@ -1,0 +1,9 @@
+# Configuración de actionlint (https://github.com/rhysd/actionlint).
+#
+# Sin este archivo, actionlint marca `runs-on: [self-hosted, oci]` como
+# etiqueta desconocida: no puede saber qué runners propios existen. Declararla
+# acá deja el linter en verde y, de paso, documenta en el repo que `oci` es la
+# etiqueta del runner de la VM — la única propia del proyecto.
+self-hosted-runner:
+  labels:
+    - oci
