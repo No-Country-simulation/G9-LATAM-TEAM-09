@@ -1,3 +1,27 @@
+> [!IMPORTANT]
+> ## 📦 Este repositorio es el cierre del Hackathon ONE — el proyecto continúa en otro lado
+>
+> El código de este repositorio es la entrega final del Hackathon ONE G9 y **queda como
+> está, a modo de registro**. El desarrollo continúa, bajo el nombre **EnergIA**, en:
+>
+> ### → **https://github.com/Neo236/EnergIA**
+>
+> La aplicación está desplegada y en funcionamiento en **https://energia.neo236.fun**
+>
+> **Qué cambió desde acá:** el repositorio nuevo conserva el historial completo de commits
+> y la autoría de las ocho personas del equipo. El estado exacto que ves en este repositorio
+> quedó marcado allá con el tag [`v1.0-hackathon`](https://github.com/Neo236/EnergIA/releases/tag/v1.0-hackathon).
+> A partir de ese punto, la infraestructura de Oracle Cloud (VM, Object Storage, runner de
+> despliegue) fue dada de baja y la aplicación se mudó a un servidor propio, así que la
+> documentación de este repositorio sobre despliegue y ambientes **ya no describe nada en
+> funcionamiento**.
+>
+> **Los flujos de despliegue continuo de este repositorio están desactivados**, porque
+> apuntaban a una máquina que ya no existe. El de integración continua sigue activo.
+>
+> Si trabajaste en este proyecto y querés seguir contribuyendo, pedí acceso al repositorio
+> nuevo.
+
 <div align="center">
 
 # ⚡ EnergiAI – Inteligencia para el Consumo Energético
